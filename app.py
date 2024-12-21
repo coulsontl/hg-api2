@@ -5,13 +5,77 @@ import os
 import time
 import json
 from functools import wraps
+from threading import Lock
+import random
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+import threading
 
 # 加载 .env 文件
 load_dotenv()
 
 # 从 .env 文件获取 API keys
-huggingface_api_key = os.getenv("HUGGINGFACE_API_KEY")
+huggingface_api_keys = [key.strip() for key in os.getenv("HUGGINGFACE_API_KEY", "").split(",") if key.strip()]
 api_key = os.getenv("API_KEY")
+# 获取每个 key 的并发数
+concurrent_per_key = int(os.getenv("CONCURRENT_PER_KEY", "5"))
+
+class APIKeyManager:
+    def __init__(self, api_keys, concurrent_per_key):
+        if not api_keys:
+            raise ValueError("至少需要提供一个 API key")
+        self.api_keys = api_keys
+        self.current_index = 0
+        self.lock = Lock()
+        # 为每个 API key 创建一个请求队列
+        self.client_pools = {}
+        # 设置线程池
+        self.executor = ThreadPoolExecutor(max_workers=len(api_keys) * concurrent_per_key)
+        
+    def get_client(self, model):
+        with self.lock:
+            try:
+                if not self.api_keys:
+                    raise ValueError("API keys 列表为空")
+                
+                self.current_index = self.current_index % len(self.api_keys)
+                current_key = self.api_keys[self.current_index]
+                
+                # 为每个请求创建新的 client 实例
+                client = InferenceClient(
+                    model=model,
+                    api_key=current_key
+                )
+                
+                # 更新索引，实现轮询
+                self.current_index = (self.current_index + 1) % len(self.api_keys)
+                return client
+            except Exception as e:
+                print(f"获取 API client 时发生错误: {str(e)}")
+                # 如果出错，尝试使用第一个可用的 key
+                first_key = self.api_keys[0] if self.api_keys else None
+                if first_key:
+                    return InferenceClient(
+                        model=model,
+                        api_key=first_key
+                    )
+                return None
+
+    async def execute_request(self, model, messages, temperature, max_tokens, top_p, stream):
+        client = self.get_client(model)
+        if not client:
+            raise ValueError("无法获取可用的 API client")
+            
+        return client.chat.completions.create(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stream=stream
+        )
+
+# 创建 API key 管理器实例
+key_manager = APIKeyManager(huggingface_api_keys, concurrent_per_key)
 
 app = Flask(__name__)
 
@@ -32,23 +96,24 @@ def require_api_key(f):
 def chat_completions():
     data = request.json
     messages = data.get('messages', [])
-    model = data.get('model', 'gpt2')  # 默认使用 gpt2，但允许客户端指定任何模型
+    model = data.get('model', 'gpt2')
     temperature = data.get('temperature', 0.7)
     max_tokens = data.get('max_tokens', 8196)
-    top_p = min(max(data.get('top_p', 0.9), 0.0001), 0.9999)  # 确保 top_p 在有效范围内
+    top_p = min(max(data.get('top_p', 0.9), 0.0001), 0.9999)
     stream = data.get('stream', False)
 
     try:
-        # 为每个请求创建一个新的 InferenceClient 实例
-        client = InferenceClient(model=model, api_key=huggingface_api_key)
-
-        response = client.chat.completions.create(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            stream=stream
+        # 在线程池中执行请求
+        future = key_manager.executor.submit(
+            key_manager.execute_request,
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            top_p,
+            stream
         )
+        response = future.result()  # 等待结果
 
         if stream:
             def generate():
