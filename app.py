@@ -10,6 +10,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 import threading
+import asyncio
 
 # 加载 .env 文件
 load_dotenv()
@@ -61,7 +62,7 @@ class APIKeyManager:
                     )
                 return None
 
-    async def execute_request(self, model, messages, temperature, max_tokens, top_p, stream):
+    def execute_request(self, model, messages, temperature, max_tokens, top_p, stream):
         client = self.get_client(model)
         if not client:
             raise ValueError("无法获取可用的 API client")
@@ -103,7 +104,7 @@ def chat_completions():
     stream = data.get('stream', False)
 
     try:
-        # 在线程池中执行请求
+        # 直接在线程池中执行同步请求
         future = key_manager.executor.submit(
             key_manager.execute_request,
             model,
